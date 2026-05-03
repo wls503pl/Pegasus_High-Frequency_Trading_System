@@ -154,4 +154,19 @@ Pegasus relies on **historical tick data** as its primary input for strategy dev
 
 ---
 
+## 🐍 Python Research & Data Environment
+
+Pegasus uses a lightweight Python stack for data acquisition, strategy research, and backtesting. The core tools are:
+
+| Tool / Library | Role | Link |
+|---|---|---|
+| **Anaconda** | Python environment & package manager | [anaconda.com](https://www.anaconda.com) |
+| **Jupyter Notebook** | Interactive research environment | [jupyter.org](https://jupyter.org) |
+| **ccxt** | Unified API client for 100+ crypto exchanges | [docs.ccxt.com](https://docs.ccxt.com) |
+| **pandas** | Data processing and DataFrame manipulation | [pandas.pydata.org](https://pandas.pydata.org) |
+
+> The Python layer handles market data ingestion and analysis. The core trading engine is written in **Modern C++**.
+
+---
+
 *Pegasus — fly fast, trade smart.* 🐎
