@@ -33,6 +33,6 @@ df = df[['date', 'open', 'high', 'low', 'close', 'volume']]
 pd.set_option('display.float_format', lambda x: '%.2f' % x)
 pd.set_option('display.max_rows', 666)
 
-df.to_csv('/home/dayda/Pegasus_High-Frequency_Trading_System/test_data/SOL_USDT_daily.csv', index=False)
+df.to_csv('/home/dayda/Pegasus_High-Frequency_Trading_System/tests/test_data/SOL_USDT_daily.csv', index=False)
 print(df)
 print(f"\n共 {len(df)} 条数据")

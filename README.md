@@ -27,7 +27,7 @@ Programmatic Trading
 
 | Style | Description |
 |---|---|
-| **Programmatic Trading** | Any trade executed by a computer program (officially defined in China since Oct 2024) |
+| **Programmatic Trading** | Any trade executed by a computer program (officially defined by China Securities Regulatory Commission (CSRC) since Oct 2024) |
 | **Algorithmic Trading** | Uses algorithms to split large orders and minimize market impact |
 | **Quantitative Trading** | Derives strategies from historical data using statistics and mathematical models |
 | **High-Frequency Trading** | Sub-second to microsecond execution; profits from tiny, rapid price movements |
@@ -162,7 +162,7 @@ Pegasus uses a lightweight Python stack for data acquisition, strategy research,
 |---|---|---|
 | **Anaconda** | Python environment & package manager | [anaconda.com](https://www.anaconda.com) |
 | **Jupyter Notebook** | Interactive research environment | [jupyter.org](https://jupyter.org) |
-| **ccxt** | Unified API client for 100+ crypto exchanges | [docs.ccxt.com](https://docs.ccxt.com) |
+| **ccxt** | Unified API client for 100+ crypto exchanges | [docs.ccxt.com](https://github.com/ccxt/ccxt) |
 | **pandas** | Data processing and DataFrame manipulation | [pandas.pydata.org](https://pandas.pydata.org) |
 
 > The Python layer handles market data ingestion and analysis. The core trading engine is written in **Modern C++**.
