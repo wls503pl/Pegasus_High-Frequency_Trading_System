@@ -8,7 +8,7 @@
 
 ## 📌 Overview
 
-**Pegasus** is a production-grade, latency-critical trading system designed for the **cryptocurrency market**, built with **Modern C++ (C++17/20)** principles. It spans the full stack from raw market data ingestion to order execution, with engineering decisions grounded in low-level systems knowledge: cache topology, lock-free concurrency, branchless algorithms, and invasive performance profiling.
+**Pegasus** is a production-grade, latency-critical trading system designed for the **cryptocurrency market**, built with **Modern C++ (C++11/17/20)** principles. It spans the full stack from raw market data ingestion to order execution, with engineering decisions grounded in low-level systems knowledge: cache topology, lock-free concurrency, branchless algorithms, and invasive performance profiling.
 
 The system is designed to be **iterative and inheritable** — strategies are codified into tested, version-controlled components that can be evolved without losing institutional knowledge.
 
@@ -19,24 +19,28 @@ The system is designed to be **iterative and inheritable** — strategies are co
 ## 🏗️ System Architecture
 
 ```
-┌────────────────────────────────────────────────────────────────┐
-│                        Pegasus System                          │
-│                                                                │
-│  ┌─────────────┐    SHM Queue       ┌──────────────────────┐   │
-│  │ Market Feed │ ───(lock-free)──▶ │   Strategy Engine    │   │
-│  │  (Producer) │                    │  (Consumer × N)      │   │
-│  └─────────────┘                    └──────────┬───────────┘   │
-│                                                │               │
-│                                     ┌──────────▼───────────┐   │
-│                                     │   Order Execution    │   │
-│                                     │   + Risk Control     │   │
-│                                     └──────────────────────┘   │
-│                                                                │
-│  IPC: Shared Memory  |  No kernel involvement on hot path      │
-└────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                        Pegasus System                           │
+│                                                                 │
+│  ┌──────────────────┐  mmap (Quote)    ┌─────────────────────┐  │
+│  │ Market Data      │ ──────────────▶ │  Matching Engine    │  │
+│  │ Gateway          │  sequence-gated  │  Lock-free OrderBook│  │
+│  │ WebSocket + JSON │                  │  SPSC Queue         │  │
+│  └──────────────────┘                  └──────────┬──────────┘  │
+│                                                   │             │
+│                                        mmap(Trade)│             │
+│                                                   ▼             │
+│                                        ┌─────────────────────┐  │
+│                                        │  Custody Verifier   │  │
+│                                        │  ECDSA Verification │  │
+│                                        │  Protobuf → Disk    │  │
+│                                        └─────────────────────┘  │
+│                                                                 │
+│   IPC: mmap ring buffer  |  No kernel involvement on hot path   │
+└─────────────────────────────────────────────────────────────────┘
 ```
 
-Each major component runs as an **independent process**. A crash in one strategy process does not cascade to the execution or feed layer — a critical design constraint for any system managing real assets.
+Each component runs as an **independent process**. A crash in the Market Data Gateway does not affect the Matching Engine or Custody Verifier — a hard requirement for any system managing real assets. Quote gaps (sequence discontinuity) are detected at the Matching Engine boundary and trigger stale-data suppression before orders are generated.
 
 ---
 
@@ -120,12 +124,11 @@ Traditional sockets and OS IPC mechanisms involve context switches and kernel in
 
 - **Single producer** increments `write_counter` to reserve space, copies data, then increments `read_counter` to publish. Consumers only read both counters — no write contention.
 - **False sharing prevention**: `write_counter` and `read_counter` each occupy a dedicated, `alignas(64)` cache line.
-- **Batch reservation**: Producer reserves blocks (e.g., 100KB at a time) rather than incrementing the atomic counter per message, reducing atomic operation frequency by ~1000×.
+- **Batch reservation**: Producer reserves blocks (e.g., 100KB at a time) rather than incrementing the atomic counter per message, reducing atomic operation frequency significantly.
 - **Copy semantics, not pointers**: Variable-length messages are copied directly into the ring buffer. Passing raw pointers across process boundaries is unsafe and architecturally incorrect.
-- **Fan-out pattern**: Multiple strategy consumers read the same market data stream — each gets a full copy, enabling independent strategy isolation.
 - **Protocol versioning**: Shared memory header includes magic number + major/minor version to prevent silent misinterpretation when the protocol evolves or when a stale process opens the wrong segment.
 
-![Shared Memory Queue Architecture](./img/shared_memory_architecture.png)
+![Shared Memory Queue Architecture](./img/shm_queue_architecture.svg)
 *Figure: Lock-free shared memory queue with dual-counter design.*
 
 ---
@@ -135,10 +138,10 @@ Traditional sockets and OS IPC mechanisms involve context switches and kernel in
 Pegasus avoids `std::mutex` on all hot paths. The concurrency model is built on three layers:
 
 ### 1. Process Isolation (Coarse Grain)
-Each strategy and each system component (feed, execution, risk) runs as a separate OS process. A segfault in one strategy cannot corrupt another's state. Shared memory provides zero-copy data sharing without entangling process lifetimes.
+The three system components — Market Data Gateway, Matching Engine, and Custody Verifier — each run as a separate OS process. A segfault in one process cannot corrupt another's state. mmap provides zero-copy data sharing without entangling process lifetimes.
 
 ### 2. Lock-Free Queue (Medium Grain)
-The SHM queue described above handles all cross-process messaging with no mutex — purely atomic counter operations and memory fences.
+The mmap ring buffer handles all cross-process messaging with no mutex — purely atomic counter operations and memory fences.
 
 ### 3. Cache-Line Discipline (Fine Grain)
 Structs that are modified by different threads/cores are padded to prevent **false sharing** (two independent variables sitting on the same 64-byte cache line, causing invisible coherence traffic):
@@ -211,6 +214,8 @@ Pegasus uses a layered profiling stack. Intuition is never trusted without data.
 
 Intel's four-category top-down model is used to identify the class of bottleneck before diving into code:
 
+![Intel Perf Micro-Structure](./img/perf_microstructure.png)
+
 | Category | What it reveals | Example finding |
 |---|---|---|
 | **Instruction Retire** | % of cycles doing useful work | Baseline efficiency |
@@ -230,6 +235,8 @@ perf record -g ./pegasus_feed && perf report
 
 For benchmark regression testing, `libpapi` provides programmatic access to hardware performance counters with near-zero overhead, enabling precise quantification of optimizations:
 
+![lib papi](./img/lib_papi.png)
+
 ```cpp
 // Measure cache misses and IPC directly in benchmark harness
 PAPI_read(event_set, before);
@@ -238,32 +245,17 @@ PAPI_read(event_set, after);
 // Compare: branch mispredictions, L1/L2 misses, instructions per cycle
 ```
 
-**Measured result (branchless vs branching binary search):**
-- Branch mispredictions: reduced by ~80%
+Reference benchmarks:
+- Branch mispredictions: reduced by ~80% (branchless vs branching binary search)
 - IPC: improved from **1.4 → 1.57**
+
 ![Branchless Binary Search Graph](./img/branchless_binary_search_graph.png)
 
 ### Layer 3 — TSC Invasive Profiling (Event Loop)
 
-For nanosecond-resolution timing of specific code sections within the event loop, **RDTSC** (Read Time-Stamp Counter) is used. RDTSC is a single instruction with ~20-cycle overhead — orders of magnitude cheaper than `clock_gettime()`:
+For nanosecond-resolution timing of specific code sections, `rdtscp` combined with `lfence` barriers is used. `rdtscp` is a serialising instruction — it waits for all prior instructions to retire before reading the counter, preventing CPU out-of-order execution from distorting measurements. Overhead is ~20 cycles, orders of magnitude cheaper than `clock_gettime()`.
 
-```cpp
-struct ScopeTimer {
-    uint64_t start;
-    const char* label;
-    ScopeTimer(const char* l) : label(l), start(__builtin_ia32_rdtsc()) {}
-    ~ScopeTimer() {
-        uint64_t elapsed = __builtin_ia32_rdtsc() - start;
-        LatencyHistogram::record(label, elapsed);
-    }
-};
-
-// Usage: drops ~20 cycles of overhead, sub-nanosecond resolution
-{
-    ScopeTimer t("order_book_update");
-    book.apply(market_event);
-}
-```
+See [`PegasusRDTSCTimer.hpp`](./include/PegasusRDTSCTimer.hpp) for the full implementation including CPU frequency calibration and RAII scope timer.
 
 ### Layer 4 — Clang XRay (Production Profiling)
 
@@ -293,7 +285,7 @@ While Pegasus targets cryptocurrency exchanges (which do not enforce co-location
 | Intel DPDK | Direct NIC access, user-space | ~500ns–1µs |
 | Layer 2 API (EF_VI) | Raw Ethernet frame level | ~700ns (AMD Zen4) |
 
-Current Pegasus deployment uses standard sockets. The architecture is designed so that swapping in a kernel-bypass transport (DPDK or OpenOnload) requires changes only at the feed ingestion boundary — all downstream components are transport-agnostic.
+Current Pegasus deployment uses standard sockets. The architecture is designed so that swapping in a kernel-bypass transport requires changes only at the feed ingestion boundary — all downstream components are transport-agnostic.
 
 ---
 
@@ -301,13 +293,15 @@ Current Pegasus deployment uses standard sockets. The architecture is designed s
 
 | Component | Choice | Rationale |
 |---|---|---|
-| **Core language** | C++17/20 | Zero-cost abstractions, full hardware control |
-| **Strategy research** | Python (pandas, ccxt, Jupyter) | Fast iteration for backtesting |
-| **Market data source** | Historical tick data / Exchange WebSocket | Highest resolution input |
-| **Profiling** | `perf`, `libpapi`, TSC, Clang XRay | Layered, scientific measurement |
-| **IPC** | Lock-free shared memory queue | Zero kernel involvement post-setup |
-| **Build system** | CMake + Clang | XRay support, LTO, PGO-compatible |
-| **Target market** | Cryptocurrency exchanges (overseas) | 24/7 operation, T+0 settlement |
+| **Core language** | C++17 | Zero-cost abstractions, full hardware control |
+| **Cryptography** | OpenSSL (ECDSA) | Trade record signing and verification in Custody layer |
+| **Serialisation** | Protobuf | Custody records: cross-process, version-tolerant |
+| **Market data** | Exchange WebSocket (Binance/OKX) | Real-time BBO feed ingestion |
+| **Profiling** | `perf`, `libpapi`, `rdtscp`, Clang XRay | Layered, scientific measurement |
+| **IPC** | mmap ring buffer (lock-free) | Zero kernel involvement on hot path |
+| **Build system** | CMake + Clang | XRay support, LTO, sanitizer profiles |
+| **Sanitizers** | ASan / TSan | Memory and thread safety enforced in CI |
+| **Target market** | Cryptocurrency exchanges (overseas) | 24/7 operation, instant settlement |
 
 ---
 
