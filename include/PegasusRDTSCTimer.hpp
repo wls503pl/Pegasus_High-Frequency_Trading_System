@@ -8,71 +8,79 @@
 /**
  * @namespace pegasus
  * @brief High-precision timing utilities using the CPU's Time Stamp Counter (TSC).
- * 
+ *
  * In High-Frequency Trading (HFT), measuring latency in nanoseconds is critical.
  * This header provides tools to read the TSC and convert cycles to nanoseconds
- * with minimal overhead.
+ * with minimal overhead and maximum accuracy, accounting for CPU out-of-order
+ * execution effects.
  */
 namespace pegasus {
 
 /**
- * @brief Reads the CPU's Time Stamp Counter (TSC).
- * 
- * Uses the 'rdtsc' assembly instruction to get the current number of CPU cycles
- * since reset. This is the fastest way to get high-resolution timing data.
- * 
+ * @brief Executes the CPUID instruction to serialize instruction execution.
+ *
+ * CPUID acts as a full memory and instruction barrier, ensuring that all
+ * instructions before it complete before any instructions after it begin.
+ * This is crucial for accurate TSC readings, especially when measuring
+ * very short code paths, to prevent CPU out-of-order execution from distorting
+ * timing measurements.
+ */
+inline void cpuid() {
+    __asm__ __volatile__("cpuid" : : : "eax", "ebx", "ecx", "edx");
+}
+
+/**
+ * @brief Reads the CPU's Time Stamp Counter (TSC) with additional serialization.
+ *
+ * Uses the 'rdtscp' assembly instruction, which is a serializing instruction.
+ * This means it waits for all previous instructions to complete before reading
+ * the TSC, providing a more accurate measurement point than 'rdtsc' alone.
+ * The 'lfence' instruction is also used as an additional memory barrier to
+ * prevent reordering by the CPU, ensuring precise timing for critical sections.
+ *
  * @return uint64_t Current CPU cycles.
  */
-inline uint64_t rdtsc() {
-    /**
-     * __asm__: 告诉编译器这里要插入一段原始的汇编代码。
-     * __volatile__: 一个关键的限定符。告知编译器：“不要动（优化）这段代码！”。
-     如果没有它，编译器可能会认为这段代码有副作用而将其优化掉，或者为了性能将其移动到循环外面,
-     这会导致测量的计时区间完全错误。
-     * "rdtsc": 这是指令助记符（Read Time-Stamp Counter）。它会读取 CPU 自上电以来的时钟周期数。
-     该指令将 64 位的结果拆分成两部分：高 32 位存入 EDX 寄存器，低 32 位存入 EAX 寄存器。
-     * "=a"(lo): 这是输出约束（Output Operand）。
-        - a 代表 EAX 寄存器.
-        - = 表示该操作数是只写的。
-        - 这句话的意思是：“指令执行完后，把 EAX 寄存器的值赋给 C++ 变量 lo。”
-     * "=d"(hi): 同上。
-        - d 代表 EDX 寄存器。
-        - 这句话的意思是：“把 EDX 寄存器的值赋给 C++ 变量 hi。”
-     * :,:: 这里跳过了输入操作数（Input Operands），因为 rdtsc 不需要输入。
-     * "memory": 这是Broker列表（Clobber List），也是最体现 HFT 功底的地方。
-        - 它充当了内存屏障（Memory Barrier）。它告诉编译器：“这段汇编可能会读取或修改任何内存位置”。
-        - 核心作用：强制编译器在执行 rdtsc 之前，必须完成所有之前的内存读写操作；并且在 rdtsc 执行完之前，
-        不能开始任何之后的内存操作。
-        - 为什么重要？：如果没有这个屏障，编译器为了优化可能会把你想测量的代码挪到 rdtsc 之外，
-        导致你测出来的延迟是 0 或者负数(编译器过早优化计时)
-     */
+inline uint64_t rdtscp() {
     uint32_t lo, hi;
-    __asm__ __volatile__(
-        "rdtsc"
-        : "=a"(lo), "=d"(hi)
-        :: "memory" // Memory barrier to prevent compiler reordering
-    );
+    // lfence acts as a load barrier, ensuring all previous loads are complete.
+    // It also prevents subsequent instructions from executing until prior loads are finished.
+    __asm__ __volatile__("lfence" : : : "memory");
+    // rdtscp reads the TSC and also writes the processor ID to ECX (not used here).
+    // It is a serializing instruction, meaning it waits for all prior instructions
+    // to complete before reading the TSC.
+    __asm__ __volatile__("rdtscp" : "=a"(lo), "=d"(hi) : : "ecx");
+    // lfence after rdtscp ensures that no subsequent instructions are reordered
+    // before the rdtscp instruction completes, further enhancing measurement accuracy.
+    __asm__ __volatile__("lfence" : : : "memory");
     return (static_cast<uint64_t>(hi) << 32) | lo;
 }
 
 /**
  * @brief Calibrates the CPU frequency to determine cycles per nanosecond.
- * 
- * This function measures the number of TSC cycles over a known wall-clock 
+ *
+ * This function measures the number of TSC cycles over a known wall-clock
  * duration (using std::chrono) to calculate the conversion factor.
- * 
+ * It's crucial for converting raw cycle counts into meaningful time units.
+ * Calibration is performed once at startup to minimize overhead during runtime.
+ *
  * @return double The number of CPU cycles per one nanosecond.
  */
 inline double calibrateCyclesPerNs() {
     using namespace std::chrono;
-    constexpr int SLEEP_MS = 200; // Calibration window
+    constexpr int SLEEP_MS = 200; // Calibration window: 200 milliseconds
 
-    uint64_t c0 = rdtsc();
+    // Ensure CPU is not in a power-saving state during calibration.
+    // cpuid() acts as a serialization barrier before starting the measurement.
+    cpuid();
+    uint64_t c0 = rdtscp();
     auto     t0 = steady_clock::now();
 
+    // Sleep for a short duration to get a reliable wall-clock measurement.
     std::this_thread::sleep_for(milliseconds(SLEEP_MS));
 
-    uint64_t c1 = rdtsc();
+    // cpuid() acts as a serialization barrier after the measurement.
+    cpuid();
+    uint64_t c1 = rdtscp();
     auto     t1 = steady_clock::now();
 
     double ns = static_cast<double>(
@@ -82,10 +90,11 @@ inline double calibrateCyclesPerNs() {
 
 /**
  * @brief Retrieves the calibrated cycles-per-nanosecond factor.
- * 
- * Uses a thread-safe static local variable (C++11 "Magic Statics") to 
- * ensure calibration happens exactly once upon the first call.
- * 
+ *
+ * Uses a thread-safe static local variable (C++11 "Magic Statics") to
+ * ensure calibration happens exactly once upon the first call in a thread-safe manner.
+ * This avoids repeated calibration overhead.
+ *
  * @return double The cached cycles-per-nanosecond factor.
  */
 inline double getCyclesPerNs() {
@@ -95,7 +104,7 @@ inline double getCyclesPerNs() {
 
 /**
  * @brief Converts raw CPU cycles to nanoseconds.
- * @param cycles The number of cycles measured via rdtsc().
+ * @param cycles The number of cycles measured via rdtscp().
  * @return double The equivalent duration in nanoseconds.
  */
 inline double cyclesToNs(uint64_t cycles) {
@@ -104,32 +113,36 @@ inline double cyclesToNs(uint64_t cycles) {
 
 /**
  * @class RDTSCScopeTimer
- * @brief RAII-based(Resource Acquisition Is Initialization 资源获取即初始化)
-   scope timer for nanosecond-level profiling.
- * 
- * Automatically measures the duration of a code block and prints the 
- * result in both CPU cycles and nanoseconds upon destruction.
- * 
+ * @brief RAII-based (Resource Acquisition Is Initialization) scope timer for
+ *        nanosecond-level profiling.
+ *
+ * Automatically measures the duration of a code block and prints the
+ * result in both CPU cycles and nanoseconds upon destruction. This is useful
+ * for quickly profiling critical sections of code.
+ *
  * Example:
+ * @code
  * {
  *     RDTSCScopeTimer timer("CriticalPath");
  *     // ... high-performance code ...
- * }
+ * } // Timer automatically stops and prints duration here
+ * @endcode
  */
 class RDTSCScopeTimer {
 public:
     /**
-     * @brief Starts the timer with a specific label.
-     * @param label The name of the code block being measured.
+     * @brief Constructs the timer and starts measurement.
+     * @param label The name of the code block being measured, for logging purposes.
      */
     explicit RDTSCScopeTimer(const std::string& label)
-        : label_(label), start_(rdtsc()) {}
+        : label_(label), start_(rdtscp()) {}
 
     /**
-     * @brief Stops the timer and logs the elapsed time.
+     * @brief Destructor stops the timer and logs the elapsed time.
+     * Ensures that timing results are always reported when the scope is exited.
      */
     ~RDTSCScopeTimer() {
-        uint64_t cycles  = rdtsc() - start_;
+        uint64_t cycles  = rdtscp() - start_;
         double   ns      = cyclesToNs(cycles);
         std::cout << "[RDTSC] " << label_
                   << " : " << cycles << " cycles"
@@ -137,8 +150,8 @@ public:
     }
 
 private:
-    std::string label_;
-    uint64_t    start_;
+    std::string label_; // Label for the timed code block
+    uint64_t    start_; // Starting TSC value
 };
 
 } // namespace pegasus

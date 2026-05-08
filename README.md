@@ -36,7 +36,7 @@ The system is designed to be **iterative and inheritable** — strategies are co
 │                                        │  Protobuf → Disk    │  │
 │                                        └─────────────────────┘  │
 │                                                                 │
-│   IPC: mmap ring buffer  |  No kernel involvement on hot path   │
+│  IPC: mmap ring buffer  |  No kernel involvement on hot path    │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -103,33 +103,60 @@ alignas(64) std::array<PriceLevel, MAX_LEVELS> ask_levels;
 
 ---
 
-## 🔗 Inter-Process Communication: Lock-Free Shared Memory Queue
+## 🔗 Inter-Process Communication: Lock-Free Shared Memory
 
-Traditional sockets and OS IPC mechanisms involve context switches and kernel involvement — unacceptable on the hot path. Pegasus uses a **lock-free shared memory queue** for all inter-process communication.
+Traditional sockets and OS IPC involve kernel context switches on every message — unacceptable on the hot path. Pegasus uses **mmap-based shared memory**: once the mapping is established, reads and writes are plain memory accesses with no kernel involvement.
 
-### Design
+### Segment Layout
+
+Every mmap segment has the same flat layout:
 
 ```
-┌────────────────────────────────────────────────────────┐
-│              Shared Memory Segment                     │
-│                                                        │
-│  [Header: magic | version_major | version_minor]       │
-│  [write_counter]  ←── producer only writes             │
-│  [read_counter]   ←── producer writes, consumers read  │
-│  [data ring buffer: variable-length messages]          │
-└────────────────────────────────────────────────────────┘
+[ ProtocolHeader : 64 bytes ] — magic, version, capacity
+[ write_counter  : 64 bytes ] — alignas(64), producer writes only
+[ T[Capacity]               ] — ring buffer of 64-byte POD structs
 ```
 
-**Key design decisions:**
+### One Counter Design
 
-- **Single producer** increments `write_counter` to reserve space, copies data, then increments `read_counter` to publish. Consumers only read both counters — no write contention.
-- **False sharing prevention**: `write_counter` and `read_counter` each occupy a dedicated, `alignas(64)` cache line.
-- **Batch reservation**: Producer reserves blocks (e.g., 100KB at a time) rather than incrementing the atomic counter per message, reducing atomic operation frequency significantly.
-- **Copy semantics, not pointers**: Variable-length messages are copied directly into the ring buffer. Passing raw pointers across process boundaries is unsafe and architecturally incorrect.
-- **Protocol versioning**: Shared memory header includes magic number + major/minor version to prevent silent misinterpretation when the protocol evolves or when a stale process opens the wrong segment.
+Pegasus uses a **single `write_counter`** per channel. The producer copies the message into the slot first, then does a release store on `write_counter`. The consumer does an acquire load on `write_counter` — if it has advanced, the message is ready to read.
+
+There is no intermediate state where the counter is ahead of the data. This is the simplest correct SPSC protocol:
+
+```
+Producer:  memcpy(slot, msg)                     // write data first
+           write_counter.store(n+1, release)     // then publish
+
+Consumer:  n = write_counter.load(acquire)       // check for new data
+           if n > cursor: memcpy(out, slot)      // safe to read
+```
+
+The acquire/release pair forms a happens-before relationship — the consumer always sees the complete message, never a partial write.
+
+### Three Classes, Three Responsibilities
+
+| Class | Role |
+|---|---|
+| `MmapRegion` | Owns the mmap lifetime only — open, size, map, unmap |
+| `ShmProducer<T, N>` | Writes messages, advances `write_counter` |
+| `ShmConsumer<T, N>` | Reads messages via its own private cursor |
+
+The consumer maps the segment **read-only**. The kernel enforces this at the hardware level — a stray consumer write segfaults immediately rather than silently corrupting the producer's data.
+
+The consumer's read cursor is **private** (not in shared memory). Each consumer process manages its own position independently with no coordination required.
+
+### Protocol Header
+
+Each segment is self-describing via a `ProtocolHeader` at offset 0:
+
+- **magic** — detects wrong file path or a stale segment from a previous run
+- **version_major / version_minor** — detects producer/consumer ABI mismatch after redeploy
+- **capacity** — lets the consumer compute slot offsets without hardcoding the size
+
+The consumer validates all three fields before touching any ring buffer data.
 
 ![Shared Memory Queue Architecture](./img/shm_queue_architecture.svg)
-*Figure: Lock-free shared memory queue with dual-counter design.*
+*Figure: Lock-free shared memory queue — one counter, three responsibilities.*
 
 ---
 
@@ -140,19 +167,16 @@ Pegasus avoids `std::mutex` on all hot paths. The concurrency model is built on 
 ### 1. Process Isolation (Coarse Grain)
 The three system components — Market Data Gateway, Matching Engine, and Custody Verifier — each run as a separate OS process. A segfault in one process cannot corrupt another's state. mmap provides zero-copy data sharing without entangling process lifetimes.
 
-### 2. Lock-Free Queue (Medium Grain)
-The mmap ring buffer handles all cross-process messaging with no mutex — purely atomic counter operations and memory fences.
+### 2. Lock-Free IPC (Medium Grain)
+The mmap ring buffer handles all cross-process messaging with no mutex — a single atomic counter with release/acquire memory ordering.
 
 ### 3. Cache-Line Discipline (Fine Grain)
-Structs that are modified by different threads/cores are padded to prevent **false sharing** (two independent variables sitting on the same 64-byte cache line, causing invisible coherence traffic):
+Structs that are accessed by different cores are aligned to prevent **false sharing** (two independent variables on the same 64-byte cache line causing invisible coherence traffic):
 
 ```cpp
 struct alignas(64) QueueHead {
     std::atomic<uint64_t> write_counter;
-    char _pad1[64 - sizeof(std::atomic<uint64_t>)];
-
-    std::atomic<uint64_t> read_counter;
-    char _pad2[64 - sizeof(std::atomic<uint64_t>)];
+    char _pad[64 - sizeof(std::atomic<uint64_t>)];
 };
 ```
 
@@ -177,10 +201,9 @@ void on_update(const MarketUpdate& update, Handler&& handler) {
 
 ### IIFE for Cold Path Isolation
 
-Error handling, logging, and fallback paths are wrapped in **Immediately Invoked Function Expressions (IIFEs)** to prevent the compiler from inlining cold code into hot instruction cache lines:
+Error handling and fallback paths are wrapped in `__attribute__((noinline))` lambdas to keep cold code out of the hot instruction cache:
 
 ```cpp
-// Cold path (error handling) isolated from hot path I-Cache
 auto handle_error = [&]() __attribute__((noinline)) {
     log_and_recover(ctx);
 };
@@ -192,7 +215,7 @@ if (__builtin_expect(error_condition, 0)) {
 
 ### `[[likely]]` / `[[unlikely]]` Annotations
 
-Branch prediction hints are applied at all known-skewed branches to guide compiler code layout:
+Branch prediction hints guide compiler code layout at all known-skewed branches:
 
 ```cpp
 if ([[likely]] order_valid) {
@@ -212,7 +235,7 @@ Pegasus uses a layered profiling stack. Intuition is never trusted without data.
 
 ### Layer 1 — `perf` Top-Down Micro-architectural Analysis
 
-Intel's four-category top-down model is used to identify the class of bottleneck before diving into code:
+Intel's four-category top-down model identifies the class of bottleneck before diving into code:
 
 ![Intel Perf Micro-Structure](./img/perf_microstructure.png)
 
@@ -224,28 +247,24 @@ Intel's four-category top-down model is used to identify the class of bottleneck
 | **Back-End Bound** | Memory latency, execution unit stalls | `std::map` cache miss penalty |
 
 ```bash
-# Top-down analysis
 perf stat --topdown -a -- ./pegasus_feed
-
-# Hotspot sampling
 perf record -g ./pegasus_feed && perf report
 ```
 
 ### Layer 2 — Hardware Counters via `libpapi`
 
-For benchmark regression testing, `libpapi` provides programmatic access to hardware performance counters with near-zero overhead, enabling precise quantification of optimizations:
+`libpapi` provides programmatic access to hardware performance counters with near-zero overhead:
 
 ![lib papi](./img/lib_papi.png)
 
 ```cpp
-// Measure cache misses and IPC directly in benchmark harness
 PAPI_read(event_set, before);
 run_benchmark();
 PAPI_read(event_set, after);
 // Compare: branch mispredictions, L1/L2 misses, instructions per cycle
 ```
 
-Reference benchmarks:
+Reference Benchmarks:
 - Branch mispredictions: reduced by ~80% (branchless vs branching binary search)
 - IPC: improved from **1.4 → 1.57**
 
@@ -253,19 +272,19 @@ Reference benchmarks:
 
 ### Layer 3 — TSC Invasive Profiling (Event Loop)
 
-For nanosecond-resolution timing of specific code sections, `rdtscp` combined with `lfence` barriers is used. `rdtscp` is a serialising instruction — it waits for all prior instructions to retire before reading the counter, preventing CPU out-of-order execution from distorting measurements. Overhead is ~20 cycles, orders of magnitude cheaper than `clock_gettime()`.
+For nanosecond-resolution timing, `rdtscp` combined with `lfence` barriers is used. `rdtscp` is a serialising instruction — it waits for all prior instructions to retire before reading the counter, preventing CPU out-of-order execution from distorting measurements. Overhead is ~20 cycles, orders of magnitude cheaper than `clock_gettime()`.
 
 See [`PegasusRDTSCTimer.hpp`](./include/PegasusRDTSCTimer.hpp) for the full implementation including CPU frequency calibration and RAII scope timer.
 
 ### Layer 4 — Clang XRay (Production Profiling)
 
-For production systems where instrumentation cannot be compiled in/out manually, **Clang XRay** inserts compile-time hooks (no-ops by default) that can be activated dynamically without recompilation. This enables zero-overhead production tracing on demand:
+**Clang XRay** inserts compile-time hooks (no-ops by default) that can be activated dynamically without recompilation — zero overhead in production unless explicitly enabled:
 
 ```bash
-# Compile with XRay instrumentation hooks (no-ops at runtime by default)
+# Compile with XRay hooks — no-ops at runtime by default
 clang++ -fxray-instrument -fxray-instruction-threshold=1 pegasus.cpp
 
-# Activate tracing in a live process without recompile
+# Activate tracing on a live process without recompile
 XRAY_OPTIONS="patch_premain=true xray_logfile_base=xray-log." ./pegasus
 ```
 
