@@ -2,7 +2,7 @@
 
 > *Named after the winged horse of Greek mythology — built for speed, precision, and endurance.*
 
-![Pegasus HFT System](./img/Pegasus_HFT_System.png)
+![Pegasus HFT System](./img/Pegasus_HFT_System_Evolution.png)
 
 ---
 
