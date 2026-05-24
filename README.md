@@ -73,6 +73,11 @@ The order book is the heart of the system. Its implementation went through a del
 #### Stage 2 — `std::vector` + `std::lower_bound` (Intermediate)
 
 `std::vector` guarantees **contiguous memory**, enabling the CPU to load cache lines efficiently. Binary search via `std::lower_bound` gives `O(log N)` lookup.
+![map vs vector](./img/map_vs_vector.png)
+*Figure: std::map latency vs std::vector.*
+
+![branchless lower bound](./img/lower_bound_branchless.png)
+*Figure: latency of lower_bound/branchless.*
 
 However: insertion and deletion require element shifting — `O(N)`. More critically, profiling with `perf record` revealed that **over 30% of CPU time** was spent on conditional jumps inside `std::lower_bound` due to branch mispredictions (market data is inherently unpredictable, defeating the branch predictor).
 
